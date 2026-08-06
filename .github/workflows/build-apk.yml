@@ -47,12 +47,103 @@ jobs:
       # always answers UNAVAILABLE, and Amazon rejects the app ("IAP displays
       # error"). The SDK comes from Maven Central via patch_gradle.py — no local
       # jar is needed or allowed (a local jar causes Duplicate class errors).
+      # Fully self-contained: does NOT call any tools/ script, so a stale
+      # tools/enable_amazon_iap.sh in the repo can never break this step.
       - name: Enable REAL Amazon IAP bridge
         run: |
           set -euo pipefail
-          rm -f android/app/libs/amazon-appstore-sdk*.jar
-          chmod +x tools/enable_amazon_iap.sh
-          ./tools/enable_amazon_iap.sh
+
+          # 1) Never allow a local SDK jar (Duplicate class errors). The SDK
+          #    comes from Maven Central via tools/patch_gradle.py.
+          rm -f android/app/libs/*.jar
+
+          # 2) Replace the stub MainActivity with the real Amazon IAP bridge.
+          cp android_overlay/amazon_iap/AmazonIapBridge.kt \
+             android/app/src/main/kotlin/com/itschool/toddler_coloring/MainActivity.kt
+
+          # 3) Declare the Amazon response receiver in the manifest (if missing).
+          python3 - <<'PY'
+          import io
+          path = "android/app/src/main/AndroidManifest.xml"
+          text = io.open(path, encoding="utf-8").read()
+          receiver = '''
+                  <receiver
+                      android:name="com.amazon.device.iap.ResponseReceiver"
+                      android:permission="com.amazon.inapp.purchasing.Permission.NOTIFY"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="com.amazon.inapp.purchasing.NOTIFY" />
+                      </intent-filter>
+                  </receiver>
+          '''
+          if "com.amazon.device.iap.ResponseReceiver" in text:
+              print("receiver already present")
+          else:
+              text = text.replace("    </application>", receiver + "    </application>", 1)
+              io.open(path, "w", encoding="utf-8").write(text)
+              print("receiver added")
+          PY
+
+          # 4) ProGuard/R8 keep rules so the SDK survives release shrinking.
+          python3 - <<'PY'
+          import io, os, re, sys
+          rules = ("# Amazon Appstore SDK - required keep rules\n"
+                   "-dontwarn com.amazon.**\n"
+                   "-keep class com.amazon.** { *; }\n"
+                   "-keepattributes *Annotation*\n")
+          pro = "android/app/proguard-rules.pro"
+          existing = io.open(pro, encoding="utf-8").read() if os.path.exists(pro) else ""
+          if "com.amazon." not in existing:
+              io.open(pro, "a", encoding="utf-8").write(("\n" if existing and not existing.endswith("\n") else "") + rules)
+              print("wrote Amazon keep rules to " + pro)
+          gradle = "android/app/build.gradle.kts"
+          kts = os.path.exists(gradle)
+          if not kts:
+              gradle = "android/app/build.gradle"
+          text = io.open(gradle, encoding="utf-8").read()
+          if "proguard-rules.pro" in text:
+              print("proguardFiles already wired")
+              sys.exit(0)
+          if kts:
+              line = ('            proguardFiles(\n'
+                      '                getDefaultProguardFile("proguard-android-optimize.txt"),\n'
+                      '                "proguard-rules.pro",\n'
+                      '            )\n')
+          else:
+              line = "            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'\n"
+          new_text, count = re.subn(r"(buildTypes\s*\{[^{]*release\s*\{\n)", r"\1" + line.replace("\\", "\\\\"), text, count=1)
+          if count != 1:
+              print("ERROR: release buildType not found in " + gradle)
+              sys.exit(1)
+          io.open(gradle, "w", encoding="utf-8").write(new_text)
+          print("wired proguardFiles into " + gradle)
+          PY
+
+          # 5) Make sure Gradle has the Maven SDK dependency and NO fileTree(libs).
+          python3 - <<'PY'
+          import io, os, sys
+          gradle = "android/app/build.gradle.kts"
+          if not os.path.exists(gradle):
+              gradle = "android/app/build.gradle"
+          text = io.open(gradle, encoding="utf-8").read()
+          changed = False
+          for bad in ('    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))\n',
+                      "    implementation fileTree(dir: 'libs', include: ['*.jar'])\n"):
+              if bad in text:
+                  text = text.replace(bad, "")
+                  changed = True
+                  print("removed fileTree(libs) dependency")
+          if "com.amazon.device:amazon-appstore-sdk" not in text:
+              if gradle.endswith(".kts"):
+                  text += '\ndependencies {\n    implementation("com.amazon.device:amazon-appstore-sdk:3.0.9")\n}\n'
+              else:
+                  text += "\ndependencies {\n    implementation 'com.amazon.device:amazon-appstore-sdk:3.0.9'\n}\n"
+              changed = True
+              print("added Maven SDK dependency")
+          if changed:
+              io.open(gradle, "w", encoding="utf-8").write(text)
+          print("gradle dependency state OK")
+          PY
           # Prove the stub is gone before we even build.
           grep -q 'PurchasingService' android/app/src/main/kotlin/com/itschool/toddler_coloring/MainActivity.kt || {
             echo 'ERROR: MainActivity is still the stub, real IAP bridge not applied'; exit 1; }
