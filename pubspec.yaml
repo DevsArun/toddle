@@ -1,0 +1,23 @@
+name: toddler_coloring
+description: "Baby Coloring: Toddler Games - offline, ad-free coloring app for Amazon Fire tablets."
+publish_to: 'none'
+version: 1.0.3+4
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: '>=3.19.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  shared_preferences: ^2.2.3
+  path_provider: ^2.1.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  # Kept wide on purpose so `flutter pub get` never fails on a newer Flutter.
+  flutter_lints: '>=3.0.0 <7.0.0'
+
+flutter:
+  uses-material-design: true
