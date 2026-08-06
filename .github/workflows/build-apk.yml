@@ -1,0 +1,177 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Versions
+        run: |
+          flutter --version
+          java -version
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Run tests
+        run: flutter test --reporter expanded
+
+      - name: Generate Android project
+        run: |
+          chmod +x tools/prepare_android.sh
+          ./tools/prepare_android.sh
+
+      # CRITICAL: without this step the APK ships the stub MainActivity that
+      # always answers UNAVAILABLE, and Amazon rejects the app ("IAP displays
+      # error"). The SDK comes from Maven Central via patch_gradle.py — no local
+      # jar is needed or allowed (a local jar causes Duplicate class errors).
+      - name: Enable REAL Amazon IAP bridge
+        run: |
+          set -euo pipefail
+          rm -f android/app/libs/amazon-appstore-sdk*.jar
+          chmod +x tools/enable_amazon_iap.sh
+          ./tools/enable_amazon_iap.sh
+          # Prove the stub is gone before we even build.
+          grep -q 'PurchasingService' android/app/src/main/kotlin/com/itschool/toddler_coloring/MainActivity.kt || {
+            echo 'ERROR: MainActivity is still the stub, real IAP bridge not applied'; exit 1; }
+          grep -q 'com.amazon.device.iap.ResponseReceiver' android/app/src/main/AndroidManifest.xml || {
+            echo 'ERROR: Amazon IAP ResponseReceiver missing from manifest'; exit 1; }
+          echo "Real Amazon IAP bridge active"
+
+      - name: Confirm this is the real app, not the Flutter demo
+        run: |
+          grep -q 'ToddlerColoringApp' lib/main.dart
+          grep -q 'shared_preferences' pubspec.yaml
+          grep -q 'kArtParts' lib/data/art_specs.dart
+          echo "source files intact"
+
+      # These four values live in GitHub Settings > Secrets and variables >
+      # Actions. The keystore itself never enters the repository or build log.
+      - name: Configure private release certificate
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_KEYSTORE_BASE64" || { echo "Missing SIGNING_KEYSTORE_BASE64 secret"; exit 1; }
+          test -n "$SIGNING_STORE_PASSWORD" || { echo "Missing SIGNING_STORE_PASSWORD secret"; exit 1; }
+          test -n "$SIGNING_KEY_PASSWORD" || { echo "Missing SIGNING_KEY_PASSWORD secret"; exit 1; }
+          test -n "$SIGNING_KEY_ALIAS" || { echo "Missing SIGNING_KEY_ALIAS secret"; exit 1; }
+          printf '%s' "$SIGNING_KEYSTORE_BASE64" | base64 --decode > android/app/release-keystore.jks
+          cat > android/key.properties <<EOF
+          storePassword=$SIGNING_STORE_PASSWORD
+          keyPassword=$SIGNING_KEY_PASSWORD
+          keyAlias=$SIGNING_KEY_ALIAS
+          storeFile=release-keystore.jks
+          EOF
+          keytool -list -keystore android/app/release-keystore.jks \
+            -storepass "$SIGNING_STORE_PASSWORD" -alias "$SIGNING_KEY_ALIAS" >/dev/null
+          keytool -list -v -keystore android/app/release-keystore.jks \
+            -storepass "$SIGNING_STORE_PASSWORD" -alias "$SIGNING_KEY_ALIAS" \
+            | sed -n 's/^[[:space:]]*SHA256: //p' \
+            | tr -d ':' | tr '[:upper:]' '[:lower:]' \
+            > expected-certificate-sha256.txt
+          test -s expected-certificate-sha256.txt
+          echo "private release certificate loaded"
+
+      # Belt-and-braces: no local SDK jar may ever sit in libs when the Maven
+      # dependency is active, or Gradle fails with "Duplicate class".
+      - name: Remove any stray Appstore SDK jars
+        run: |
+          rm -f android/app/libs/amazon-appstore-sdk*.jar
+          ls -la android/app/libs/ 2>/dev/null || true
+
+      - name: Build debug APK for Appetize
+        run: flutter build apk --debug
+
+      - name: Build signed Amazon release APK
+        run: flutter build apk --release
+
+      # Amazon rejects any APK carrying Android's shared debug certificate.
+      # Verify the exact file before exposing it as a downloadable artifact.
+      - name: Prove release APK is privately signed
+        run: |
+          set -euo pipefail
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)
+          test -n "$APKSIGNER" || { echo "apksigner not found"; exit 1; }
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee certificate-report.txt
+          if grep -qi "Android Debug" certificate-report.txt; then
+            echo "ERROR: release APK still uses Android Debug certificate"
+            exit 1
+          fi
+          ACTUAL_SHA256=$(sed -n 's/^.*Signer: certificate SHA-256 digest: //p' certificate-report.txt | head -1)
+          EXPECTED_SHA256=$(cat expected-certificate-sha256.txt)
+          test -n "$ACTUAL_SHA256" || { echo "Certificate digest missing from apksigner output"; exit 1; }
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "ERROR: APK certificate does not match the permanent release key"
+            exit 1
+          fi
+          echo "SIGNED RELEASE VERIFIED — certificate matches permanent key"
+
+      # Final gate: the release APK itself must contain the Amazon IAP SDK
+      # classes. If this fails, the APK would be rejected again by Amazon.
+      - name: Prove Amazon IAP SDK is inside the release APK
+        run: |
+          set -euo pipefail
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          unzip -p "$APK" 'classes*.dex' 2>/dev/null \
+            | grep -aq 'com/amazon/device/iap' || {
+            echo 'ERROR: Amazon IAP classes NOT found in release APK — do not upload this file'; exit 1; }
+          echo "Amazon IAP SDK confirmed inside release APK"
+
+      - name: Gradle diagnostics on failure
+        if: failure()
+        run: |
+          echo '===== android/app/build.gradle(.kts) ====='
+          cat android/app/build.gradle.kts 2>/dev/null || cat android/app/build.gradle 2>/dev/null || true
+          echo '===== android/gradle.properties ====='
+          cat android/gradle.properties 2>/dev/null || true
+          echo '===== AndroidManifest.xml ====='
+          cat android/app/src/main/AndroidManifest.xml 2>/dev/null || true
+          echo '===== gradle-wrapper.properties ====='
+          cat android/gradle/wrapper/gradle-wrapper.properties 2>/dev/null || true
+          echo '===== flutter doctor ====='
+          flutter doctor -v || true
+
+      - name: Upload Amazon release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AMAZON-UPLOAD-signed-release
+          path: |
+            build/app/outputs/flutter-apk/app-release.apk
+            certificate-report.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Appetize debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: APPETIZE-ONLY-debug
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
